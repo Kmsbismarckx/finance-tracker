@@ -1,210 +1,112 @@
-mod models;
-mod storage;
+//! Точка входа приложения.
+//!
+//! Здесь происходит "склейка" всех слоёв:
+//! 1. Загрузка конфигурации
+//! 2. Подключение к БД
+//! 3. Создание зависимостей (Dependency Injection)
+//! 4. Запуск HTTP сервера
 
-use clap::{Parser, Subcommand};
-use models::Account;
-use storage::Storage;
-use uuid::Uuid;
+mod application;
+mod domain;
+mod infrastructure;
+mod presentation;
 
-#[derive(Parser)]
-#[command(name = "finance-tracker")]
-#[command(about = "A personal finance tracker", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
+use sqlx::postgres::PgPoolOptions;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Create a new account
-    AddAccount {
-        /// Name of the account
-        name: String,
-        /// Currency code (e.g., USD, EUR, RUB)
-        #[arg(default_value = "USD")]
-        currency: String,
-    },
-    /// List all accounts
-    ListAccounts,
-    /// Delete an account
-    DeleteAccount {
-        /// Account ID or name
-        account: String,
-    },
-    /// Deposit money to an account
-    Deposit {
-        /// Account ID or name
-        account: String,
-        /// Amount to deposit
-        amount: f64,
-    },
-    /// Withdraw money from an account
-    Withdraw {
-        /// Account ID or name
-        account: String,
-        /// Amount to withdraw
-        amount: f64,
-    },
-    /// Show account details
-    ShowAccount {
-        /// Account ID or name
-        account: String,
-    },
-}
+use crate::application::services::AccountService;
+use crate::infrastructure::config::Config;
+use crate::infrastructure::database::PostgresAccountRepository;
+use crate::presentation::api::routes::create_router;
 
-fn main() {
-    let cli = Cli::parse();
+/// Точка входа — async main с tokio runtime.
+///
+/// # Атрибут `#[tokio::main]`
+/// Преобразует async fn main в обычный fn main с tokio runtime:
+/// ```text
+/// fn main() {
+///     tokio::runtime::Runtime::new().unwrap().block_on(async { ... })
+/// }
+/// ```
+///
+/// # Возвращаемый тип
+/// `Result<(), Box<dyn std::error::Error>>` — позволяет использовать `?`
+/// для любых ошибок. `Box<dyn Error>` — trait object для любой ошибки.
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ═══════════════════════════════════════════════════════════════
+    // 1. Загрузка переменных окружения из .env файла
+    // ═══════════════════════════════════════════════════════════════
+    // .ok() — игнорируем ошибку если файла нет
+    dotenvy::dotenv().ok();
 
-    let result = match cli.command {
-        Commands::AddAccount { name, currency } => add_account(name, currency),
-        Commands::ListAccounts => list_accounts(),
-        Commands::DeleteAccount { account } => delete_account(account),
-        Commands::Deposit { account, amount } => deposit(account, amount),
-        Commands::Withdraw { account, amount } => withdraw(account, amount),
-        Commands::ShowAccount { account } => show_account(account),
-    };
+    // ═══════════════════════════════════════════════════════════════
+    // 2. Инициализация логирования (tracing)
+    // ═══════════════════════════════════════════════════════════════
+    tracing_subscriber::registry()
+        // EnvFilter — фильтрует логи по уровню
+        // "info,sqlx=warn" — всё на уровне INFO, но sqlx только WARN
+        .with(tracing_subscriber::EnvFilter::new(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info,sqlx=warn".into()),
+        ))
+        // fmt::layer — форматирует логи для консоли
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
-    if let Err(e) = result {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
-    }
-}
+    // ═══════════════════════════════════════════════════════════════
+    // 3. Загрузка конфигурации
+    // ═══════════════════════════════════════════════════════════════
+    let config = Config::from_env()?;
 
-fn add_account(name: String, currency: String) -> Result<(), String> {
-    let mut storage = Storage::load()?;
+    // ═══════════════════════════════════════════════════════════════
+    // 4. Создание пула соединений с PostgreSQL
+    // ═══════════════════════════════════════════════════════════════
+    let pool = PgPoolOptions::new()
+        .max_connections(5) // Максимум 5 соединений в пуле
+        .connect(&config.database_url)
+        .await?;
 
-    if storage.find_account_by_name(&name).is_some() {
-        return Err(format!("Account with name '{}' already exists", name));
-    }
+    // ═══════════════════════════════════════════════════════════════
+    // 5. Применение миграций БД
+    // ═══════════════════════════════════════════════════════════════
+    // sqlx::migrate! — макрос, который включает миграции в бинарник
+    // на этапе компиляции. Путь относительно Cargo.toml.
+    sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let account = Account::new(name.clone(), currency);
-    println!("Created account: {} (ID: {})", name, account.id);
+    tracing::info!("Database connected and migrations applied");
 
-    storage.add_account(account);
-    storage.save()?;
+    // ═══════════════════════════════════════════════════════════════
+    // 6. Dependency Injection — создание графа зависимостей
+    // ═══════════════════════════════════════════════════════════════
+    // Порядок важен: Repository → Service → Router
+    let repository = PostgresAccountRepository::new(pool);
+    let service = AccountService::new(repository);
 
-    Ok(())
-}
-
-fn list_accounts() -> Result<(), String> {
-    let storage = Storage::load()?;
-    let accounts = storage.get_all_accounts();
-
-    if accounts.is_empty() {
-        println!("No accounts found.");
-        return Ok(());
-    }
-
-    println!(
-        "\n{:<38} {:<20} {:<15} {:<10}",
-        "ID", "Name", "Balance", "Currency"
-    );
-    println!("{}", "-".repeat(85));
-
-    for account in accounts {
-        println!(
-            "{:<38} {:<20} {:>15.2} {:<10}",
-            account.id, account.name, account.balance, account.currency
+    // ═══════════════════════════════════════════════════════════════
+    // 7. Создание роутера с middleware
+    // ═══════════════════════════════════════════════════════════════
+    let app = create_router(service)
+        // TraceLayer — логирует все HTTP запросы
+        .layer(TraceLayer::new_for_http())
+        // CorsLayer — разрешает cross-origin запросы (для фронтенда)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any) // Разрешить любой origin
+                .allow_methods(Any) // Разрешить любые методы
+                .allow_headers(Any), // Разрешить любые headers
         );
-    }
 
-    Ok(())
-}
+    // ═══════════════════════════════════════════════════════════════
+    // 8. Запуск HTTP сервера
+    // ═══════════════════════════════════════════════════════════════
+    let addr = config.server_addr();
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!("Server running on http://{}", addr);
 
-fn delete_account(account_identifier: String) -> Result<(), String> {
-    let mut storage = Storage::load()?;
-
-    let account_id = if let Ok(uuid) = Uuid::parse_str(&account_identifier) {
-        uuid
-    } else {
-        storage
-            .find_account_by_name(&account_identifier)
-            .ok_or(format!("Account '{}' not found", account_identifier))?
-            .id
-    };
-
-    storage.delete_account(&account_id)?;
-    storage.save()?;
-
-    println!("Account deleted successfully");
-    Ok(())
-}
-
-fn deposit(account_identifier: String, amount: f64) -> Result<(), String> {
-    let mut storage = Storage::load()?;
-
-    let account_id = if let Ok(uuid) = Uuid::parse_str(&account_identifier) {
-        uuid
-    } else {
-        storage
-            .find_account_by_name(&account_identifier)
-            .ok_or(format!("Account '{}' not found", account_identifier))?
-            .id
-    };
-
-    let account = storage
-        .get_account_mut(&account_id)
-        .ok_or("Account not found")?;
-
-    account.deposit(amount)?;
-
-    println!(
-        "Deposited {:.2} {} to '{}'",
-        amount, account.currency, account.name
-    );
-    println!("New balance: {:.2} {}", account.balance, account.currency);
-
-    storage.save()?;
-    Ok(())
-}
-
-fn withdraw(account_identifier: String, amount: f64) -> Result<(), String> {
-    let mut storage = Storage::load()?;
-
-    let account_id = if let Ok(uuid) = Uuid::parse_str(&account_identifier) {
-        uuid
-    } else {
-        storage
-            .find_account_by_name(&account_identifier)
-            .ok_or(format!("Account '{}' not found", account_identifier))?
-            .id
-    };
-
-    let account = storage
-        .get_account_mut(&account_id)
-        .ok_or("Account not found")?;
-
-    account.withdraw(amount)?;
-
-    println!(
-        "Withdrew {:.2} {} from '{}'",
-        amount, account.currency, account.name
-    );
-    println!("New balance: {:.2} {}", account.balance, account.currency);
-
-    storage.save()?;
-    Ok(())
-}
-
-fn show_account(account_identifier: String) -> Result<(), String> {
-    let storage = Storage::load()?;
-
-    let account = if let Ok(uuid) = Uuid::parse_str(&account_identifier) {
-        storage.get_account(&uuid).ok_or("Account not found")?
-    } else {
-        storage
-            .find_account_by_name(&account_identifier)
-            .ok_or(format!("Account '{}' not found", account_identifier))?
-    };
-
-    println!("\nAccount Details:");
-    println!("  ID:         {}", account.id);
-    println!("  Name:       {}", account.name);
-    println!("  Balance:    {:.2} {}", account.balance, account.currency);
-    println!(
-        "  Created:    {}",
-        account.created_at.format("%Y-%m-%d %H:%M:%S")
-    );
+    // axum::serve — запускает сервер и блокирует до завершения
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
